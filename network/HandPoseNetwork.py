@@ -4,18 +4,19 @@ import os, pickle
 from utils.general import *
 from utils.utils import multiply
 import matplotlib.pyplot as plt
+from .Layers import *
 
 class ColorHandPose3DNetwork(object):
     def __init__(self, hand_side='left'):
         self.crop_size = 256
         self.J = 21
+        hand_side = tf.constant([[0., 1.]]) if hand_side == 'right' else tf.constant([[1., 0.]])
+        self.hand_side = hand_side
 
         self.setup_HandSegNet()
         self.setup_PoseNet2D()
         self.setup_PosePrior()
         self.setup_GestureNet()
-        hand_side = tf.constant([[0., 1.]]) if hand_side == 'right' else tf.constant([[1., 0.]])
-        self.hand_side = hand_side
 
     def inference(self, image):
         """ Full pipeline: HandSegNet + PoseNet + PosePrior.
@@ -58,23 +59,21 @@ class ColorHandPose3DNetwork(object):
 
 
     def inference_detection(self, image):
-        """ Only 2D part of the pipeline: HandSegNet + PoseNet.
+        """ HandSegNet: Detects the hand in the input image by segmenting it.
 
             Inputs:
                 image: [B, H, W, 3] tf.float32 tensor, Image with mean subtracted
+                train: bool, True in case weights should be trainable
 
             Outputs:
-                image_crop: [B, 256, 256, 3] tf.float32 tensor, Hand cropped input image
-                scale_crop: [B, 1] tf.float32 tensor, Scaling between input image and image_crop
-                center: [B, 1] tf.float32 tensor, Center of image_crop wrt to image
-                keypoints_scoremap: [B, 256, 256, 21] tf.float32 tensor, Scores for the hand keypoints
+                scoremap_list_large: list of [B, 256, 256, 2] tf.float32 tensor, Scores for the hand segmentation classes
         """
         scoremap_list = []
         x = image
         scoremap = self.HandSegNet.predict(x)
         scoremap_list.append(scoremap)
-
-        return [tf.image.resize(x, (256, 256)) for x in scoremap_list]
+        shape_of_img = image.shape
+        return [tf.image.resize(x, (shape_of_img[1], shape_of_img[2])) for x in scoremap_list]
 
     def inference_pose2d(self, image_crop):
         name_list = ['conv5_2', 'conv6_7', 'conv7_7']
@@ -170,34 +169,30 @@ class ColorHandPose3DNetwork(object):
 
 
     def setup_HandSegNet(self):
-        # Setup HandSegNet
-        self.HandSegNet = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64, name='conv1_1',
-                                   input_shape=(240, 320, 3)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64, name='conv1_2'),
-            tf.keras.layers.MaxPool2D(name='pool1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv2_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv2_2'),
-            tf.keras.layers.MaxPool2D(name='pool2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_4'),
-            tf.keras.layers.MaxPool2D(name='pool3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_4'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv5_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv5_2'),
-            tf.keras.layers.Conv2D(kernel_size=(1, 1), activation='relu', padding='same', filters=512, name='conv6_1'),
-            tf.keras.layers.Conv2D(kernel_size=(1, 1), activation='relu', padding='same', filters=2, name='conv6_2'),
-        ])
+        layer_per_block = [2, 2, 4, 4]
+        filters_list = [64, 128, 256, 512]
+        pool_list = [True, True, True, False]
+
+        input_layer = tf.keras.layers.Input((240, 320, 3))
+        x = input_layer
+        for block_id, (layer, filter, pool) in enumerate(zip(layer_per_block, filters_list, pool_list), 1):
+            for layer_id in range(layer):
+                x = Conv_relu('conv{}_{}'.format(block_id, layer_id + 1), kernel_size=3, stride=1, filters=filter)(x)
+            if pool:
+                x = Max_pool('pool{}'.format(block_id))(x)
+        x = Conv_relu('conv5_1', kernel_size=3, stride=1, filters=512)(x)
+        x = Conv_relu('conv5_2', kernel_size=3, stride=1, filters=128)(x)
+
+        x = Conv_relu('conv6_1', kernel_size=1, stride=1, filters=512)(x)
+        x = Conv('conv6_2', kernel_size=1, stride=1, filters=2)(x)
+
+        self.HandSegNet = tf.keras.Model(inputs=input_layer, outputs=x)
         with open('./res/weights/handsegnet-rhd.pickle', 'rb') as file:
             weight_dict = pickle.load(file)
+            valid_layer_name = [key.split('/')[1] for key in weight_dict.keys()]
         # Setup params to pretrained model
         for layer in self.HandSegNet.layers:
-            if layer.name.startswith('pool'):
+            if layer.name not in valid_layer_name:
                 continue
             weight = layer.weights
             name = 'HandSegNet/' + layer.name + '/'
@@ -205,46 +200,34 @@ class ColorHandPose3DNetwork(object):
             weight[1].assign(weight_dict[name + 'biases'])
 
     def setup_PoseNet2D(self):
-        self.PoseNet2D = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64, name='conv1_1',
-                                   input_shape=(256, 256, 3)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64, name='conv1_2'),
-            tf.keras.layers.MaxPool2D(name='pool1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv2_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv2_2'),
-            tf.keras.layers.MaxPool2D(name='pool2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv3_4'),
-            tf.keras.layers.MaxPool2D(name='pool3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=512, name='conv4_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv4_3'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv4_4'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv4_5'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256, name='conv4_6'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128, name='conv4_7'),
-            tf.keras.layers.Conv2D(kernel_size=(1, 1), activation='relu', padding='same', filters=512, name='conv5_1'),
-            tf.keras.layers.Conv2D(kernel_size=(1, 1), activation='relu', padding='same', filters=self.J,
-                                   name='conv5_2'),
-        ])
-        encoding = self.PoseNet2D.get_layer(name='conv4_7').output
-        x = self.PoseNet2D.get_layer(name='conv5_2').output
-        iter_num = 2
-        layer_num = 7
-        for i in range(iter_num):
-            concat_layer = tf.keras.layers.Concatenate(name='concat{}'.format(i + 1))([encoding, x])
-            self.PoseNet2D = tf.keras.Model(inputs=self.PoseNet2D.input, outputs=concat_layer)
-            x = concat_layer
-            for j in range(1, layer_num + 1):
-                k_size = 7 if j < 6 else 1
-                filters = 128 if j < 7 else self.J
-                name = 'conv{}_{}'.format(i + 6, j)
-                x = tf.keras.layers.Conv2D(kernel_size=(k_size, k_size), activation='relu' if j < 7 else None,
-                                           padding='same', filters=filters, name=name)(x)
-            self.PoseNet2D = tf.keras.Model(inputs=self.PoseNet2D.input, outputs=x)
-        # Setup params with pre-trained value.
+        layer_per_block = [2, 2, 4, 2]
+        filters_list = [64, 128, 256, 512]
+        pool_list = [True, True, True, False]
+
+        input_layer = tf.keras.layers.Input((256, 256, 3))
+        x = input_layer
+
+        for block_id, (layer_num, filter_num, pool) in enumerate(zip(layer_per_block, filters_list, pool_list), 1):
+            for layer_id in range(layer_num):
+                x = Conv_relu('conv{}_{}'.format(block_id, layer_id + 1), kernel_size=3, stride=1, filters=filter_num)(x)
+            if pool:
+                x = Max_pool('pool{}'.format(block_id))(x)
+        for i in range(3, 3 + 4):
+            x = Conv_relu('conv4_{}'.format(i), kernel_size=3, stride=1, filters=256)(x)
+        for_concat = Conv_relu('conv4_7', kernel_size=3, stride=1, filters=128)(x)
+        x = Conv_relu('conv5_1', kernel_size=1, stride=1, filters=512)(for_concat)
+        x = Conv_relu('conv5_2', kernel_size=1, stride=1, filters=self.J)(x)
+
+        layers_per_unit = 5
+        num_unit = 2
+        for pass_id in range(6, 6 + num_unit):
+            x = tf.concat([x, for_concat], 3, name='concat{}'.format(pass_id - 6))
+            for rec_id in range(layers_per_unit):
+                x = Conv_relu('conv{}_{}'.format(pass_id, rec_id + 1), kernel_size=7, stride=1, filters=128)(x)
+            x = Conv_relu('conv{}_6'.format(pass_id), kernel_size=1, stride=1, filters=128)(x)
+            x = Conv('conv{}_7'.format(pass_id), kernel_size=1, stride=1, filters=self.J)(x)
+
+        self.PoseNet2D = tf.keras.Model(inputs=input_layer, outputs=x)
         with open('./res/weights/posenet3d-rhd-stb-slr-finetuned.pickle', 'rb') as file:
             weight_dict = pickle.load(file)
             valid_layer_name = [key.split('/')[1] for key in weight_dict.keys()]
@@ -257,33 +240,23 @@ class ColorHandPose3DNetwork(object):
             weight[0].assign(np.array(weight_dict[name + 'weights']))
             weight[1].assign(weight_dict[name + 'biases'])
 
+
     def setup_PosePrior(self):
-        self.PosePrior = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=32,
-                                   name='conv_pose_0_1', input_shape=(32, 32, 21)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=32,
-                                   name='conv_pose_0_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64,
-                                   name='conv_pose_1_1',
-                                   input_shape=(32, 32, 21)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=64,
-                                   name='conv_pose_1_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128,
-                                   name='conv_pose_2_1',
-                                   input_shape=(32, 32, 21)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=128,
-                                   name='conv_pose_2_2'),
-        ])
-        x = self.PosePrior.layers[-1].output
-        temp = tf.keras.layers.Flatten()(x)
-        x = tf.concat([temp, tf.constant([[1., 0.]])], 1)
+        input_layer = tf.keras.layers.Input((32, 32, 21))
+        x = input_layer
+
+        filters_list = [32, 64, 128]
+        for i, filter in enumerate(filters_list):
+            x = Conv_relu('conv_pose_{}_1'.format(i), kernel_size=3, stride=1, filters=filter)(x)
+            x = Conv_relu('conv_pose_{}_2'.format(i), kernel_size=3, stride=2, filters=filter)(x)
+        x = tf.keras.layers.Flatten()(x)
+        x = tf.concat([x, self.hand_side], 1)
+
         for i, units in enumerate([512, 512]):
             x = tf.keras.layers.Dense(512, activation='relu', name='fc_rel%d' % i)(x)
             x = tf.keras.layers.Dropout(.2)(x)
         x = tf.keras.layers.Dense(self.J * 3, name='fc_xyz')(x)
-        self.PosePrior = tf.keras.Model(inputs=self.PosePrior.inputs, outputs=x)
-        self.PosePrior.trainable = False
-
+        self.PosePrior = tf.keras.Model(inputs=input_layer, outputs=x)
         # Setup params with pre-trained value.
         with open('./res/weights/posenet3d-rhd-stb-slr-finetuned.pickle', 'rb') as file:
             weight_dict = pickle.load(file)
@@ -297,24 +270,20 @@ class ColorHandPose3DNetwork(object):
             weight[0].assign(np.array(weight_dict[name + 'weights']))
             weight[1].assign(weight_dict[name + 'biases'])
 
-    def setup_GestureNet(self, hand_side=tf.constant([[1., 0.]])):
-        self.GestureNet = tf.keras.Sequential([
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=64,
-                                   name='conv_vp_0_1', input_shape=(32, 32, 21)),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=64,
-                                   name='conv_vp_0_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=128,
-                                   name='conv_vp_1_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=128,
-                                   name='conv_vp_1_2'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), activation='relu', padding='same', filters=256,
-                                   name='conv_vp_2_1'),
-            tf.keras.layers.Conv2D(kernel_size=(3, 3), strides=(2, 2), activation='relu', padding='same', filters=256,
-                                   name='conv_vp_2_2'),
-        ])
-        x = self.GestureNet.layers[-1].output
+    def setup_GestureNet(self):
+        n_block = 3
+        strides_list = [1, 2]
+        filters_list = [64, 128, 256]
+
+        input_layer = tf.keras.layers.Input((32, 32, 21))
+        x = input_layer
+
+        for i in range(n_block):
+            for j, stride in enumerate(strides_list):
+                x = Conv_relu(name='conv_vp_{}_{}'.format(i, j + 1), kernel_size=3,
+                              stride=stride, filters=filters_list[i])(x)
         x = tf.keras.layers.Flatten()(x)
-        x = tf.concat([x, hand_side], 1)
+        x = tf.concat([x, self.hand_side], 1)
         x = tf.keras.layers.Dense(256, activation='relu', name='fc_vp0')(x)
         x = tf.keras.layers.Dropout(.25)(x)
         x = tf.keras.layers.Dense(128, activation='relu', name='fc_vp1')(x)
@@ -322,7 +291,7 @@ class ColorHandPose3DNetwork(object):
         ux = tf.keras.layers.Dense(1, activation='relu', name='fc_vp_ux')(x)
         uy = tf.keras.layers.Dense(1, activation='relu', name='fc_vp_uy')(x)
         uz = tf.keras.layers.Dense(1, activation='relu', name='fc_vp_uz')(x)
-        self.GestureNet = tf.keras.Model(inputs=self.GestureNet.input, outputs=[ux, uy, uz])
+        self.GestureNet = tf.keras.Model(inputs=input_layer, outputs=[ux, uy, uz])
 
         # Setup params with pre-trained value
         with open('./res/weights/posenet3d-rhd-stb-slr-finetuned.pickle', 'rb') as file:

@@ -10,17 +10,15 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 if __name__ == '__main__':
-    image_list = ['./res/img/' + file_name for file_name in os.listdir('./res/img') if file_name.endswith('.png')]
     img, mask = load_data(1000)
+    pick_idx = np.random.choice(np.arange(img.shape[0]), 5)
+    image_list = ['./res/img/' + file_name for file_name in os.listdir('./res/img') if file_name.endswith('.png')]
+    image_list.extend([img[idx] for idx in pick_idx])
 
     net = ColorHandPose3DNetwork()
-    net.train_HandSegNet(img, mask, val_data=list(load_val_data()))
-    # inference = net.inference(img)
-    #
-    # hand_score_map, image_crop, scale, center, keypoint_score_map, keypoint_coord3d = tuple(inference)
 
     for image_name in image_list:
-        image = cv2.imread(image_name)
+        image = cv2.imread(image_name) if isinstance(image_name, str) else image_name
         image = cv2.resize(image, (320, 240))
         image_v = np.expand_dims((image.astype(np.float32) / 255.) - .5, axis=0)
 
@@ -37,11 +35,14 @@ if __name__ == '__main__':
         coord_hw = trafo_coords(coord_hw_crop, center, scale, 256)
 
         # visualize
-        fig = plt.figure(1)
+        fig = plt.figure(1, figsize=(16, 9))
         ax1 = fig.add_subplot(221)
         ax2 = fig.add_subplot(222)
         ax3 = fig.add_subplot(223)
         ax4 = fig.add_subplot(224, projection='3d')
+        ax1.axis('off')
+        ax2.axis('off')
+        ax3.axis('off')
         ax1.imshow(image)
         plot_hand(coord_hw, ax1)
         ax2.imshow(image_crop)

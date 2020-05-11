@@ -59,7 +59,6 @@ def plot_hand(coords_hw, axis, color_fixed=None, linewidth='1'):
             axis.plot(coords[:, 1], coords[:, 0], color=color, linewidth=linewidth)
         else:
             axis.plot(coords[:, 1], coords[:, 0], color_fixed, linewidth=linewidth)
-
 def detect_keypoints(scoremaps):
     """ Performs detection per scoremap for the hands keypoints. """
     if len(scoremaps.shape) == 4:
