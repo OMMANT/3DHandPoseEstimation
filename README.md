@@ -1,4 +1,5 @@
 # 3DHandPoseEstimation
+![ex_screenshot](sample_image.png)
 
 ## Introduction  
 This project is estimating 3D Hand Pose from a single RGB Image by using CNN(Convolutional-Neural-Network).
