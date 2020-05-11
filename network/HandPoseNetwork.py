@@ -2,7 +2,6 @@ from __future__ import print_function, unicode_literals
 import os, pickle
 
 from utils.general import *
-from utils.utils import multiply
 import matplotlib.pyplot as plt
 from .Layers import *
 
@@ -20,12 +19,8 @@ class ColorHandPose3DNetwork(object):
 
     def inference(self, image):
         """ Full pipeline: HandSegNet + PoseNet + PosePrior.
-
             Inputs:
-                image: [B, H, W, 3] tf.float32 tensor, Image with mean subtracted
-                hand_side: [B, 2] tf.float32 tensor, One hot encoding if the image is showing left or right side
-                evaluation: [] tf.bool tensor, True while evaluation false during training (controls dropout)
-
+                image: [B, 240, 320, 3] tf.float32 tensor, Image with mean subtracted
             Outputs:
                 hand_scoremap: [B, 256, 256, 2] tf.float32 tensor, Scores for background and hand class
                 image_crop: [B, 256, 256, 3] tf.float32 tensor, Hand cropped input image
@@ -60,11 +55,8 @@ class ColorHandPose3DNetwork(object):
 
     def inference_detection(self, image):
         """ HandSegNet: Detects the hand in the input image by segmenting it.
-
             Inputs:
                 image: [B, H, W, 3] tf.float32 tensor, Image with mean subtracted
-                train: bool, True in case weights should be trainable
-
             Outputs:
                 scoremap_list_large: list of [B, 256, 256, 2] tf.float32 tensor, Scores for the hand segmentation classes
         """
@@ -76,6 +68,13 @@ class ColorHandPose3DNetwork(object):
         return [tf.image.resize(x, (shape_of_img[1], shape_of_img[2])) for x in scoremap_list]
 
     def inference_pose2d(self, image_crop):
+        """ PoseNet: Given an image it detects the 2D hand keypoints.
+            The image should already contain a rather tightly cropped hand.
+            Inputs:
+                image: [B, 240, 320, 3] tf.float32 tensor, Image with mean subtracted
+            Outputs:
+                scoremap_list_large: list of [B, 256, 256, 21] tf.float32 tensor, Scores for the hand keypoints
+        """
         name_list = ['conv5_2', 'conv6_7', 'conv7_7']
         outputs = [self.PoseNet2D.get_layer(name=name).output for name in name_list]
         functions = [tf.keras.backend.function([self.PoseNet2D.input], [output]) for output in outputs]
@@ -83,6 +82,12 @@ class ColorHandPose3DNetwork(object):
         return score_map_list
 
     def inference_pose3d(self, keypoints_scoremap):
+        """ PosePrior + Viewpoint: Estimates the most likely normalized 3D pose given 2D detections and hand side.
+            Inputs:
+                keypoints_scoremap: [B, 32, 32, 21] tf.float32 tensor, Scores for the hand keypoints
+            Outputs:
+                coord_xyz_rel_normed: [B, 21, 3] tf.float32 tensor, Normalized 3D coordinates
+        """
         # infer coordinates in the canonical frame
         coord_can = self.inference_pose3d_can(keypoints_scoremap) # (B, 21, 3)
 
@@ -99,29 +104,28 @@ class ColorHandPose3DNetwork(object):
 
         return coord_xyz_rel_normed
 
-
-
     def inference_pose3d_can(self, keypoints_scoremap):
         coord_xyz_rel = [self.PosePrior.predict(np.expand_dims(x, axis=0)) for x in keypoints_scoremap]
         coord_xyz_rel = tf.reshape(coord_xyz_rel, [keypoints_scoremap.shape[0], self.J, 3])
         return coord_xyz_rel
 
     def inference_viewpoint(self, keypoints_scoremap):
+        """ Inference of canonical coordinates. """
         ux, uy, uz = self.rotation_estimation(keypoints_scoremap)
 
         rot_mat = self.get_rot_mat(ux, uy, uz)
 
         return rot_mat
 
-
     def rotation_estimation(self, scoremap):
+        """ Estimates the rotation from canonical coords to realworld xyz. """
         scoremap = tf.concat([scoremap], 3)
         output = np.array([self.GestureNet.predict(np.expand_dims(x, axis=0)) for x in scoremap]) # (B, 3, 1, 1)
 
         return output[:, 0, 0, :], output[:, 1, 0, :], output[:, 2, 0, :]
 
-
     def get_rot_mat(self, ux_b, uy_b, uz_b):
+        """ Returns a rotation matrix from axis and (encoded) angle."""
         theta = tf.math.sqrt(tf.square(ux_b) + tf.math.square(uy_b) + tf.math.square(uz_b) + 1e-8)
 
         st = tf.sin(theta)[:, 0]
@@ -140,18 +144,21 @@ class ColorHandPose3DNetwork(object):
         return trafo_matrix
 
     def stitch_mat_from_vecs(self, vector):
+        """ Stitches a given list of vectors into a 3x3 matrix."""
         batch_size = vector[0].shape[0]
         vector = [tf.reshape(x, [1, batch_size]) for x in vector]
 
-        trafo_matrix = tf.dynamic_stitch([[0], [1], [2],
+        mat = tf.dynamic_stitch([[0], [1], [2],
                                           [3], [4], [5],
                                           [6], [7], [8]], vector)
-        trafo_matrix = tf.reshape(trafo_matrix, [3, 3, batch_size])
-        trafo_matrix = tf.transpose(trafo_matrix, [2, 0, 1])
+        mat = tf.reshape(mat, [3, 3, batch_size])
+        mat = tf.transpose(mat, [2, 0, 1])
 
-        return trafo_matrix
+        return mat
 
     def flip_right_hand(self, coords_xyz_canonical, cond_right):
+        """ Flips the given canonical coordinates, when cond_right is true. Returns coords unchanged otherwise.
+                    The returned coordinates represent those of a left hand."""
         expanded = False
         s = coords_xyz_canonical.shape
         # if batch_size is 1
@@ -169,6 +176,7 @@ class ColorHandPose3DNetwork(object):
 
 
     def setup_HandSegNet(self):
+        """Setup HandSegNet network with pre-trained model"""
         layer_per_block = [2, 2, 4, 4]
         filters_list = [64, 128, 256, 512]
         pool_list = [True, True, True, False]
@@ -200,6 +208,7 @@ class ColorHandPose3DNetwork(object):
             weight[1].assign(weight_dict[name + 'biases'])
 
     def setup_PoseNet2D(self):
+        """Setup PoseNet2D network with pre-trained model"""
         layer_per_block = [2, 2, 4, 2]
         filters_list = [64, 128, 256, 512]
         pool_list = [True, True, True, False]
@@ -242,6 +251,7 @@ class ColorHandPose3DNetwork(object):
 
 
     def setup_PosePrior(self):
+        """Setup PosePrior network with pre-trained model"""
         input_layer = tf.keras.layers.Input((32, 32, 21))
         x = input_layer
 
@@ -271,6 +281,7 @@ class ColorHandPose3DNetwork(object):
             weight[1].assign(weight_dict[name + 'biases'])
 
     def setup_GestureNet(self):
+        """setup GestureNoet network with pre-trained model"""
         n_block = 3
         strides_list = [1, 2]
         filters_list = [64, 128, 256]
@@ -305,12 +316,3 @@ class ColorHandPose3DNetwork(object):
             name = 'ViewpointNet/' + layer.name + '/'
             weight[0].assign(np.array(weight_dict[name + 'weights']))
             weight[1].assign(weight_dict[name + 'biases'])
-
-    def train_HandSegNet(self, train_X, train_Y, epochs=10, batch_size=8,
-                         optimizers=tf.keras.optimizers.Adam(), loss='mse', val_data=None):
-        self.HandSegNet.compile(optimizer=optimizers,
-                                loss=loss,
-                                metrics=['accuracy'])
-        self.HandSegNet.fit(train_X, train_Y, epochs=epochs, batch_size=batch_size, validation_data=val_data)
-
-
